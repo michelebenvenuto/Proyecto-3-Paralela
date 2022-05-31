@@ -1,11 +1,13 @@
 /*
  ============================================================================
- Author        : G. Barlas
- Version       : 1.0
- Last modified : December 2014
- License       : Released under the GNU GPL 3.0
- Description   :
- To build use  : make
+ Original Author  : G. Barlas
+ Added Authors    : Saúl Contreras
+                  : Michele Benvenuto
+ Version          : 1.1
+ Last modified    : May 2022
+ License          : Released under the GNU GPL 3.0
+ Description      :
+ To build use     : make
  ============================================================================
  */
 #include <stdio.h>
@@ -23,7 +25,8 @@ const float radInc = degreeInc * M_PI / 180;
 // The CPU function returns a pointer to the accummulator
 void CPU_HoughTran (unsigned char *pic, int w, int h, int **acc)
 {
-  float rMax = sqrt (1.0 * w * w + 1.0 * h * h) / 2;  //(w^2 + h^2)/2, radio max equivalente a centro -> esquina
+  //(w^2 + h^2)/2, radio max equivalente a centro -> esquina
+  float rMax = sqrt (1.0 * w * w + 1.0 * h * h) / 2;
   *acc = new int[rBins * degreeBins];            //el acumulador, conteo depixeles encontrados, 90*180/degInc = 9000
   memset (*acc, 0, sizeof (int) * rBins * degreeBins); //init en ceros
   int xCent = w / 2;
@@ -51,10 +54,10 @@ void CPU_HoughTran (unsigned char *pic, int w, int h, int **acc)
 }
 
 //*****************************************************************
-// TODO usar memoria constante para la tabla de senos y cosenos
+// Uso de memoria constante para la tabla de senos y cosenos
 // inicializarlo en main y pasarlo al device
-//__constant__ float d_Cos[degreeBins];
-//__constant__ float d_Sin[degreeBins];
+__constant__ float d_Cos[degreeBins];
+__constant__ float d_Sin[degreeBins];
 
 //*****************************************************************
 //TODO Kernel memoria compartida
@@ -62,11 +65,35 @@ void CPU_HoughTran (unsigned char *pic, int w, int h, int **acc)
 // {
 //   //TODO
 // }
+
 //TODO Kernel memoria Constante
-// __global__ void GPU_HoughTranConst(...)
-// {
-//   //TODO
-// }
+__global__ void GPU_HoughTranConst(unsigned char *pic, int w, int h, int *acc, float rMax, float rScale)
+{
+  int gloID = blockIdx.x * blockDim.x + threadIdx.x;
+  if (gloID > w * h) return;      // in case of extra threads in block
+
+  int xCent = w / 2;
+  int yCent = h / 2;
+
+  int xCoord = gloID % w - xCent;
+  int yCoord = yCent - gloID / w;
+
+  if (pic[gloID] > 0)
+    {
+      for (int tIdx = 0; tIdx < degreeBins; tIdx++)
+        {
+          //TODO utilizar memoria constante para senos y cosenos
+          float r = xCoord * d_Cos[tIdx] + yCoord * d_Sin[tIdx]; //probar con esto para ver diferencia en tiempo
+          int rIdx = (r + rMax) / rScale;
+          // Debemos usar atomic, debido a que en los pixeles
+          // más cercanos al punto central se puede generar
+          // race conditions debido al concepto de línea
+          // en cuanto a gráficas por computador se refiere.
+          // ya que estos son valores discretos y no continuos
+          atomicAdd (acc + (rIdx * degreeBins + tIdx), 1);
+        }
+    }
+}
 
 // GPU kernel. One thread per image pixel is spawned.
 // The accummulator memory needs to be allocated by the host in global memory
@@ -121,9 +148,6 @@ int main (int argc, char **argv)
   cudaEventCreate(&start);
   cudaEventCreate(&stop);
 
-  float* d_Cos;
-  float* d_Sin;
-
   cudaMalloc ((void **) &d_Cos, sizeof (float) * degreeBins);
   cudaMalloc ((void **) &d_Sin, sizeof (float) * degreeBins);
 
@@ -145,8 +169,17 @@ int main (int argc, char **argv)
   float rScale = 2 * rMax / rBins;
 
   // TODO eventualmente volver memoria global
-  cudaMemcpy(d_Cos, pcCos, sizeof (float) * degreeBins, cudaMemcpyHostToDevice);
-  cudaMemcpy(d_Sin, pcSin, sizeof (float) * degreeBins, cudaMemcpyHostToDevice);
+
+  // CONSTANT MEMORIES CHANES
+  //
+  //
+  //
+  cudaMemcpyToSymbol (d_Cos, pcCos, sizeof (float) * degreeBins);
+  cudaMemcpyToSymbol (d_Sin, pcSin, sizeof (float) * degreeBins);
+  //
+  //
+  //
+  //
 
   // setup and copy data from host to device
   unsigned char *d_in, *h_in;
@@ -166,7 +199,7 @@ int main (int argc, char **argv)
   int blockNum = ceil (w * h / 256);
 
   cudaEventRecord(start);
-  GPU_HoughTran <<< blockNum, 256 >>> (d_in, w, h, d_hough, rMax, rScale, d_Cos, d_Sin);
+  GPU_HoughTranConst <<< blockNum, 256 >>> (d_in, w, h, d_hough, rMax, rScale);
   cudaEventRecord(stop);
   // get results from device
   cudaMemcpy (h_hough, d_hough, sizeof (int) * degreeBins * rBins, cudaMemcpyDeviceToHost);
