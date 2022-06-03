@@ -61,10 +61,44 @@ __constant__ float d_Sin[degreeBins];
 
 //*****************************************************************
 //TODO Kernel memoria compartida
-// __global__ void GPU_HoughTranShared(...)
-// {
-//   //TODO
-// }
+__global__ void GPU_HoughTranShared(unsigned char *pic, int w, int h, int *acc, float rMax, float rScale)
+{
+  int i;
+  int gloID = blockIdx.x * blockDim.x + threadIdx.x;
+  if (gloID > w * h) return;      // in case of extra threads
+
+  int locID = threadIdx.x;
+  int xCent = w / 2;
+  int yCent = h / 2;
+
+  int xCoord = gloID % w - xCent;
+  int yCoord = yCent - gloID / w;
+
+  __shared__ int localAcc[degreeBins * rBins];
+
+  for (i = locID; i < degreeBins * rBins; i += blockDim.x)
+    localAcc[i] = 0;
+  
+  // esperar a que todos los threads hagan la inicializacion
+  __syncthreads();
+
+  if (pic[gloID] > 0)
+    {
+      for (int tIdx = 0; tIdx < degreeBins; tIdx ++)
+        {
+          float r = xCoord * d_Cos[tIdx] + yCoord * d_Sin[tIdx];
+          int rIdx = (r + rMax) / rScale;
+          atomicAdd (localAcc + (rIdx * degreeBins + tIdx), 1);
+        }
+    }
+  
+    // esepramos a que todos los warps terminen los calculos
+    __syncthreads();
+
+    // atomic add para acumular lo local en lo global
+    for (i = locID; i < degreeBins * rBins; i+= blockDim.x)
+      atomicAdd (acc + i, localAcc[i]);
+}
 
 //TODO Kernel memoria Constante
 __global__ void GPU_HoughTranConst(unsigned char *pic, int w, int h, int *acc, float rMax, float rScale)
@@ -199,8 +233,10 @@ int main (int argc, char **argv)
   int blockNum = ceil (w * h / 256);
 
   cudaEventRecord(start);
-  GPU_HoughTranConst <<< blockNum, 256 >>> (d_in, w, h, d_hough, rMax, rScale);
+  GPU_HoughTranShared <<< blockNum, 256 >>> (d_in, w, h, d_hough, rMax, rScale);
   cudaEventRecord(stop);
+  cudaThreadSynchronize (); 
+  
   // get results from device
   cudaMemcpy (h_hough, d_hough, sizeof (int) * degreeBins * rBins, cudaMemcpyDeviceToHost);
 
